@@ -2640,6 +2640,261 @@ kernel void kernel_rwkv_wkv7_f32(
     }
 }
 
+// escha dense linear: y = T128(T128(x*s_in*rin) @ decode(code))*rout*s_out + bias
+//
+// One threadgroup (256 threads = 8 simdgroups) owns a (row, 128-output-block)
+// tile. The input transform is computed cooperatively into threadgroup memory
+// in 1024-element chunks (8 hadamard blocks), then each simdgroup runs the
+// vendor's fused decode-GEMV over its own 16-wide output tile, and the epilogue
+// runs the output hadamard over the 128 accumulated channels.
+//
+// decode(x) = fp16_lo(r) + fp16_hi(r), r = ((x*0xCBAC1FED) & 0x8FFF8FFF) ^ 0x3B603B60
+// (must round-to-nearest-even in fp16 -- single hardware half add, so ok)
+
+static inline half escha_cba_decode(uint x) {
+    x = x * 0xCBAC1FEDu;
+    uint r = (x & 0x8FFF8FFFu) ^ 0x3B603B60u;
+    half2 h = as_type<half2>(r);
+    return h.x + h.y;
+}
+
+// chunk of input elements staged in threadgroup memory for the hadamard
+#define ESCHA_LIN_CHUNK 1024u
+
+// per-lane window extraction -> sv[0..7] (verbatim port of the vendor formulas)
+template <uint WPT> // words (uint32) per 16x16 code tile: 16 (K=2) or 24 (K=3)
+static inline void escha_extract(device const uint * wp, uint lane, thread uint (&sv)[8]) {
+    if (WPT == 16u) {
+        const uint t_off = lane*8u;
+        const uint i1 = t_off >> 4;
+        const uint i0 = (i1 + 15u) & 15u;
+        const ulong merged = (((ulong) wp[i0]) << 32) | (ulong) wp[i1];
+        const uint wv = (uint) (merged >> (((~t_off) & 8u) << 1));
+        sv[0] = (wv >> 14) & 0xffffu; sv[1] = (wv >> 12) & 0xffffu;
+        sv[2] = (wv >> 10) & 0xffffu; sv[3] = (wv >> 8)  & 0xffffu;
+        sv[4] = (wv >> 6)  & 0xffffu; sv[5] = (wv >> 4)  & 0xffffu;
+        sv[6] = (wv >> 2)  & 0xffffu; sv[7] =  wv        & 0xffffu;
+    } else {
+        const uint t_off = lane*8u;
+        const uint b1 = (t_off + 257u)*3u;
+        const uint b2 = b1 + 21u;
+        const uint i0 = (b1 - 16u) >> 5;
+        const uint i2 = (b2 - 1u)  >> 5;
+        const uint sh2 = ((i2 + 1u) << 5) - b2;
+        const ulong merged = (((ulong) wp[i0 % 24u]) << 32) | (ulong) wp[i2 % 24u];
+        const uint w7 = (uint) (merged >> sh2);
+        const uint w3 = (uint) (merged >> (sh2 + 12u));
+        sv[0] = (w3 >> 9) & 0xffffu; sv[1] = (w3 >> 6) & 0xffffu;
+        sv[2] = (w3 >> 3) & 0xffffu; sv[3] =  w3        & 0xffffu;
+        sv[4] = (w7 >> 9) & 0xffffu; sv[5] = (w7 >> 6) & 0xffffu;
+        sv[6] = (w7 >> 3) & 0xffffu; sv[7] =  w7        & 0xffffu;
+    }
+}
+
+// escha dense linear: y = T128(T128(x*s_in*rin) @ decode(code))*rout*s_out + bias
+//
+// One threadgroup (256 threads = 8 simdgroups) owns NB consecutive 128-output
+// blocks of one row (NB=4 -> 512 outputs). Wide threadgroups make each kt step
+// read NB*8 consecutive code tiles (~2-3 KB contiguous), which streams DRAM
+// near-sequentially when threadgroups run concurrently; the staged input
+// transform is also amortized over NB x more outputs.
+template <uint WPT, uint NB>
+static void escha_linear_impl(
+        device const uint  * code,
+        device const half  * rin,
+        device const half  * rout,
+        device const float * s_in,
+        device const float * s_out,
+        device const half  * bias,
+        device const float * x,
+        device       float * dst,
+        constant uint  & IC,
+        constant uint  & OC,
+        constant uint  & M,
+        constant ulong & xs, // row stride of x, in floats
+        constant ulong & ds, // row stride of dst, in floats
+        constant int   & dbg,
+        threadgroup float * tgm,
+        uint2 pg,   // (output NB-block group, row)
+        uint  tid) {
+
+    // the transform scale folds into the pre-scale (H128 is linear)
+    const float rs = 0.088388347648318447f; // 1/sqrt(128)
+
+    const uint ocb = pg.x;
+    const uint row = pg.y;
+
+    const uint lane = tid & 31u;
+    const uint sg   = tid >> 5;
+
+    threadgroup float * u   = tgm;                       // [ESCHA_LIN_CHUNK]
+    threadgroup float * mid = tgm + ESCHA_LIN_CHUNK;     // [NB*128]
+
+    float acc0[NB], acc1[NB];
+
+    const uint l0    = lane & ~4u;
+    const uint c_off = (lane >> 2) & 1u;
+    const uint xrow  = (lane & 3u)*2u;
+
+    const uint TN = OC >> 4;
+    const ulong wstride = (ulong) TN*WPT;
+
+    device const uint * base[NB];
+    #pragma clang loop unroll(full)
+    for (uint b = 0; b < NB; ++b) {
+        acc0[b] = 0.0f;
+        acc1[b] = 0.0f;
+        base[b] = code + (ulong)(ocb*8u*NB + b*8u + sg)*WPT;
+    }
+
+    for (uint ch = 0; ch < IC; ch += ESCHA_LIN_CHUNK) {
+        const uint nch = min(ESCHA_LIN_CHUNK, IC - ch);
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // stage x*s_in*rin (with the folded transform scale)
+        for (uint i = tid; i < nch; i += 256u) {
+            u[i] = x[(ulong) row*xs + ch + i] * s_in[ch + i] * (float) rin[ch + i] * rs;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // radix-2 butterfly over each 128-block; partner element lives in the
+        // thread whose low 7 bits differ only in the stage bit
+        for (uint s = 0; s < 7u; ++s) {
+            const uint msk = 1u << s;
+            float mine[4], other[4];
+            #pragma clang loop unroll(full)
+            for (uint k = 0; k < 4u; ++k) {
+                const uint e = tid + 256u*k;
+                mine[k]  = e < nch ? u[e]         : 0.0f;
+                other[k] = e < nch ? u[e ^ msk]   : 0.0f;
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            #pragma clang loop unroll(full)
+            for (uint k = 0; k < 4u; ++k) {
+                const uint e = tid + 256u*k;
+                if (e < nch) {
+                    u[e] = (e & msk) ? (other[k] - mine[k]) : (mine[k] + other[k]);
+                }
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+
+        // decode + FMA over the chunk's 16-wide input tiles
+        const uint nt = nch >> 4;
+        for (uint t = 0; t < nt; ++t) {
+            const ulong two = (ulong)((ch >> 4) + t)*wstride;
+            #pragma clang loop unroll(full)
+            for (uint b = 0; b < NB; ++b) {
+                uint sv[8];
+                escha_extract<WPT>(base[b] + two, lane, sv);
+
+                #pragma clang loop unroll(full)
+                for (uint j = 0; j < 8u; ++j) {
+                    const uint fi = j >> 1;
+                    const uint xo = xrow + (j & 1u) + (fi & 1u)*8u;
+                    const float d = (float) escha_cba_decode(sv[j]);
+                    if (j < 4u) {
+                        acc0[b] += u[(t << 4) + xo] * d;
+                    } else {
+                        acc1[b] += u[(t << 4) + xo] * d;
+                    }
+                }
+            }
+        }
+
+        if (dbg == 1) { // staged input, post input-H (single-chunk debug only)
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            const uint nout = IC < OC ? IC : OC;
+            for (uint i = tid; i < nout; i += 256u) {
+                dst[(ulong) row*ds + i] = u[i];
+            }
+            return;
+        }
+    }
+
+    // reduce the four input-row pairs inside each lane quad
+    #pragma clang loop unroll(full)
+    for (uint b = 0; b < NB; ++b) {
+        acc0[b] += simd_shuffle_xor(acc0[b], 1u);
+        acc0[b] += simd_shuffle_xor(acc0[b], 2u);
+        acc1[b] += simd_shuffle_xor(acc1[b], 1u);
+        acc1[b] += simd_shuffle_xor(acc1[b], 2u);
+    }
+    if ((lane & 3u) == 0u) {
+        const uint col = 2u*(l0 >> 3) + c_off;
+        #pragma clang loop unroll(full)
+        for (uint b = 0; b < NB; ++b) {
+            mid[b*128u + sg*16u + col]      = acc0[b];
+            mid[b*128u + sg*16u + col + 8u] = acc1[b];
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (dbg == 2) { // raw matmul accumulators, pre output-H
+        if (tid < 128u) {
+            #pragma clang loop unroll(full)
+            for (uint b = 0; b < NB; ++b) {
+                dst[(ulong) row*ds + ocb*128u*NB + b*128u + tid] = mid[b*128u + tid];
+            }
+        }
+        return;
+    }
+
+    // output hadamard over each block's 128 accumulated channels (threads 0..127)
+    for (uint b = 0; b < NB; ++b) {
+        threadgroup float * mb = mid + b*128u;
+        for (uint s = 0; s < 7u; ++s) {
+            const uint msk = 1u << s;
+            const float mine  = tid < 128u ? mb[tid]       : 0.0f;
+            const float other = tid < 128u ? mb[tid ^ msk] : 0.0f;
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            if (tid < 128u) {
+                mb[tid] = (tid & msk) ? (other - mine) : (mine + other);
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+    }
+
+    if (tid < 128u) {
+        #pragma clang loop unroll(full)
+        for (uint b = 0; b < NB; ++b) {
+            const uint oc = ocb*128u*NB + b*128u + tid;
+            dst[(ulong) row*ds + oc] = mid[b*128u + tid]*rs*(float) rout[oc]*s_out[oc] + (float) bias[oc];
+        }
+    }
+}
+
+#define ESCHA_LIN_KERNEL(NAME, WPTV, NBV)                                     \
+kernel void NAME(                                                             \
+        device const uint  * code,                                            \
+        device const half  * rin,                                             \
+        device const half  * rout,                                            \
+        device const float * s_in,                                            \
+        device const float * s_out,                                           \
+        device const half  * bias,                                            \
+        device const float * x,                                               \
+        device       float * dst,                                             \
+        constant uint  & IC,                                                  \
+        constant uint  & OC,                                                  \
+        constant uint  & M,                                                   \
+        constant ulong & xs,                                                  \
+        constant ulong & ds,                                                  \
+        constant int   & dbg,                                                 \
+        threadgroup float * tgm [[threadgroup(0)]],                           \
+        uint3 tgpig[[threadgroup_position_in_grid]],                          \
+        uint3 tpitg[[thread_position_in_threadgroup]]) {                      \
+    escha_linear_impl<WPTV, NBV>(code, rin, rout, s_in, s_out, bias, x, dst,  \
+            IC, OC, M, xs, ds, dbg, tgm, tgpig.xy, tpitg.x);                  \
+}
+
+ESCHA_LIN_KERNEL(kernel_escha_linear_k2,      16u, 1u)
+ESCHA_LIN_KERNEL(kernel_escha_linear_k3,      24u, 1u)
+ESCHA_LIN_KERNEL(kernel_escha_linear_k2_nb2,  16u, 2u)
+ESCHA_LIN_KERNEL(kernel_escha_linear_k3_nb2,  24u, 2u)
+ESCHA_LIN_KERNEL(kernel_escha_linear_k2_nb4,  16u, 4u)
+ESCHA_LIN_KERNEL(kernel_escha_linear_k3_nb4,  24u, 4u)
+
 constant short FC_gated_delta_net_ne20 [[function_constant(FC_GATED_DELTA_NET + 0)]];
 constant short FC_gated_delta_net_ne30 [[function_constant(FC_GATED_DELTA_NET + 1)]];
 constant short FC_gated_delta_net_K    [[function_constant(FC_GATED_DELTA_NET + 2)]];
@@ -2669,8 +2924,9 @@ kernel void kernel_gated_delta_net_impl(
     const uint i21 = tgpig.y; // H (head)
     const uint i20 = tgpig.x*NSG + ty; // row within S_v
 
-    const uint i01 = i21 % args.ne01;
-    const uint i11 = i21 % args.ne11;
+    // block mapping: consecutive v-heads share a k-head (vendor: hk = hv / (Hv/Hk))
+    const uint i01 = (args.ne21 > 0 && args.ne01 > 0) ? (i21 * args.ne01) / args.ne21 : 0;
+    const uint i11 = (args.ne21 > 0 && args.ne11 > 0) ? (i21 * args.ne11) / args.ne21 : 0;
 
     const float scale = 1.0f / sqrt((float)S_v);
 
@@ -2742,8 +2998,9 @@ kernel void kernel_gated_delta_net_impl(
 
         y = simd_sum(y);
 
+        // no extra 1/sqrt(Dk): input-side q scaling (inv_scale^2 fold) sets magnitude
         if (tx == 0) {
-            dst_attn[t*args.ne21*S_v] = y*scale;
+            dst_attn[t*args.ne21*S_v] = y;
         }
 
         q_ptr += args.ns02;
@@ -2811,8 +3068,9 @@ kernel void kernel_gated_delta_net_impl(
     const uint i21 = tgpig.y; // H
     const uint i20 = tgpig.x*NSG + ty;
 
-    const uint i01 = i21 % args.ne01;
-    const uint i11 = i21 % args.ne11;
+    // block mapping: consecutive v-heads share a k-head (vendor: hk = hv / (Hv/Hk))
+    const uint i01 = (args.ne21 > 0 && args.ne01 > 0) ? (i21 * args.ne01) / args.ne21 : 0;
+    const uint i11 = (args.ne21 > 0 && args.ne11 > 0) ? (i21 * args.ne11) / args.ne21 : 0;
 
     const float scale = 1.0f / sqrt((float)S_v);
 

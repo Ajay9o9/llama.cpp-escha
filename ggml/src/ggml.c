@@ -1084,6 +1084,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "DSV4_HC_PRE",
     "DSV4_HC_POST",
     "ESCHA_MOE",
+    "ESCHA_LINEAR",
 
     "UNARY",
 
@@ -1101,7 +1102,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "GLU",
 };
 
-static_assert(GGML_OP_COUNT == 102, "GGML_OP_COUNT != 102");
+static_assert(GGML_OP_COUNT == 103, "GGML_OP_COUNT != 102");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1217,7 +1218,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "glu(x)",
 };
 
-static_assert(GGML_OP_COUNT == 102, "GGML_OP_COUNT != 102");
+static_assert(GGML_OP_COUNT == 103, "GGML_OP_COUNT != 102");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -6530,6 +6531,64 @@ struct ggml_tensor * ggml_escha_moe(
     result->src[4] = dep;
     result->src[5] = x;
     result->src[6] = ids;
+
+    return result;
+}
+
+struct ggml_tensor * ggml_escha_linear(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * code,
+        struct ggml_tensor  * rin,
+        struct ggml_tensor  * rout,
+        struct ggml_tensor  * s_in,
+        struct ggml_tensor  * s_out,
+        struct ggml_tensor  * bias,
+        struct ggml_tensor  * x) {
+    GGML_ASSERT(code->type == GGML_TYPE_I16);
+    GGML_ASSERT(rin ->type == GGML_TYPE_F16);
+    GGML_ASSERT(rout->type == GGML_TYPE_F16);
+    GGML_ASSERT(s_in ->type == GGML_TYPE_F32);
+    GGML_ASSERT(s_out->type == GGML_TYPE_F32);
+    GGML_ASSERT(bias->type == GGML_TYPE_F16);
+    GGML_ASSERT(x   ->type == GGML_TYPE_F32);
+
+    GGML_ASSERT(ggml_is_contiguous(code));
+    GGML_ASSERT(ggml_is_contiguous(rin));
+    GGML_ASSERT(ggml_is_contiguous(rout));
+    GGML_ASSERT(ggml_is_contiguous(s_in));
+    GGML_ASSERT(ggml_is_contiguous(s_out));
+    GGML_ASSERT(ggml_is_contiguous(bias));
+    GGML_ASSERT(ggml_is_contiguous_rows(x));
+
+    GGML_ASSERT(code->ne[0] == 32 || code->ne[0] == 48); // 16*K, K = 2 or 3
+    GGML_ASSERT(code->ne[3] == 1);
+
+    const int64_t OC = code->ne[1]*16;
+    const int64_t IC = code->ne[2]*16;
+
+    // the rotations are applied per 128-block, so both axes must be a multiple of 128
+    GGML_ASSERT(IC % 128 == 0);
+    GGML_ASSERT(OC % 128 == 0);
+
+    GGML_ASSERT(rin ->ne[0] == IC);
+    GGML_ASSERT(rout->ne[0] == OC);
+    GGML_ASSERT(s_in ->ne[0] == IC);
+    GGML_ASSERT(s_out->ne[0] == OC);
+    GGML_ASSERT(bias->ne[0] == OC);
+
+    GGML_ASSERT(x->ne[0] == IC);
+
+    const int64_t ne[4] = { OC, x->ne[1], x->ne[2], x->ne[3] };
+    struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne);
+
+    result->op     = GGML_OP_ESCHA_LINEAR;
+    result->src[0] = code;
+    result->src[1] = rin;
+    result->src[2] = rout;
+    result->src[3] = s_in;
+    result->src[4] = s_out;
+    result->src[5] = bias;
+    result->src[6] = x;
 
     return result;
 }

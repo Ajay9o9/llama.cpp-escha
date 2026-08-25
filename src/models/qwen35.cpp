@@ -12,6 +12,12 @@ void llama_model_qwen35::load_arch_hparams(llama_model_loader & ml) {
     ml.get_key(LLM_KV_SSM_TIME_STEP_RANK, hparams.ssm_dt_rank);
     ml.get_key(LLM_KV_SSM_GROUP_COUNT,    hparams.ssm_n_group);
 
+    // dense linears stay in the escha 2-bit code when this is present
+    ml.get_key(LLM_KV_ESCHA_VERSION, escha_version, false);
+    if (escha_version != 0 && escha_version != 1) {
+        throw std::runtime_error(format("unsupported escha codec version %u", escha_version));
+    }
+
     // NextN/MTP (Qwen3.5/3.6): extra decoder block appended beyond the main stack
     ml.get_key(LLM_KV_NEXTN_PREDICT_LAYERS, hparams.n_layer_nextn, false);
     GGML_ASSERT(hparams.n_layer_nextn < hparams.n_layer_all && "n_layer_nextn must be < n_layer_impl");
@@ -94,6 +100,56 @@ void llama_model_qwen35::load_arch_tensors(llama_model_loader & ml) {
         layer.ffn_up   = create_tensor(tn(LLM_TENSOR_FFN_UP,   "weight", il), {n_embd,   n_ff}, flags);
     };
 
+    // one escha-coded dense linear: the code carries its own bit width in ne[0]
+    auto load_escha_linear = [&](llm_escha_dense & e, llm_tensor t, int il,
+                                 int64_t ic, int64_t oc, int flags) {
+        const std::string cname = tn(t, "escha_code", il).str();
+
+        const auto * w = ml.get_weight(cname.c_str());
+        if (w == nullptr) {
+            throw std::runtime_error("escha model is missing " + cname);
+        }
+
+        const int64_t n_code = w->tensor->ne[0];
+        if (n_code != 32 && n_code != 48) {
+            throw std::runtime_error(format("%s: unsupported code width %d", cname.c_str(), (int) n_code));
+        }
+
+        e.code  = create_tensor(tn(t, "escha_code",  il), { n_code, oc/16, ic/16 }, flags);
+        e.rin   = create_tensor(tn(t, "escha_rin",   il), { ic }, flags);
+        e.rout  = create_tensor(tn(t, "escha_rout",  il), { oc }, flags);
+        e.s_in  = create_tensor(tn(t, "escha_s_in",  il), { ic }, flags);
+        e.s_out = create_tensor(tn(t, "escha_s_out", il), { oc }, flags);
+        e.bias  = create_tensor(tn(t, "escha_bias", il), { oc }, flags);
+    };
+
+    if (escha_version != 0) {
+        const int64_t head_k_dim = hparams.ssm_d_state;
+        const int64_t key_dim    = head_k_dim*hparams.ssm_n_group;
+        const int64_t value_dim  = head_k_dim*hparams.ssm_dt_rank;
+
+        // stock weight lookups below degrade to optional; the escha sidecars
+        // carry the real projections, norms and plain GDN tensors still load
+        for (int i = 0; i < n_layer; ++i) {
+            auto & layer = layers[i];
+
+            if (!hparams.is_recr(i)) {
+                load_escha_linear(layer.escha_wq, LLM_TENSOR_ATTN_Q,   i, n_embd, n_embd_head_k*n_head*2, 0);
+                load_escha_linear(layer.escha_wk, LLM_TENSOR_ATTN_K,   i, n_embd, n_embd_k_gqa, 0);
+                load_escha_linear(layer.escha_wv, LLM_TENSOR_ATTN_V,   i, n_embd, n_embd_v_gqa, 0);
+                load_escha_linear(layer.escha_wo, LLM_TENSOR_ATTN_OUT, i, n_embd_head_k*n_head, n_embd, 0);
+            } else {
+                load_escha_linear(layer.escha_wqkv,      LLM_TENSOR_ATTN_QKV,  i, n_embd, key_dim*2 + value_dim, 0);
+                load_escha_linear(layer.escha_wqkv_gate, LLM_TENSOR_ATTN_GATE, i, n_embd, value_dim, 0);
+                load_escha_linear(layer.escha_ssm_out,   LLM_TENSOR_SSM_OUT,   i, value_dim, n_embd, 0);
+            }
+
+            load_escha_linear(layer.escha_ffn_gate, LLM_TENSOR_FFN_GATE, i, n_embd, n_ff, 0);
+            load_escha_linear(layer.escha_ffn_up,   LLM_TENSOR_FFN_UP,   i, n_embd, n_ff, 0);
+            load_escha_linear(layer.escha_ffn_down, LLM_TENSOR_FFN_DOWN, i, n_ff, n_embd, 0);
+        }
+    }
+
     auto load_block_mtp = [&](int il) {
         auto & layer = layers[il];
 
@@ -120,7 +176,7 @@ void llama_model_qwen35::load_arch_tensors(llama_model_loader & ml) {
     };
 
     for (int i = 0; i < n_layer; ++i) {
-        load_block_trunk(i, trunk_flags);
+        load_block_trunk(i, escha_version != 0 ? (trunk_flags | TENSOR_NOT_REQUIRED) : trunk_flags);
     }
     for (int i = n_layer; i < n_layer_all; ++i) {
         load_block_mtp(i);
@@ -228,17 +284,27 @@ llama_model_qwen35::graph::graph(const llama_model & model, const llm_graph_para
     ggml_build_forward_expand(gf, cur);
 }
 
+ggml_tensor * llama_model_qwen35::graph::build_escha_mm(
+        ggml_tensor *           cur,
+        const llm_escha_dense & e,
+        ggml_tensor *           w) {
+    if (!e.active()) {
+        return build_lora_mm(w, cur, nullptr);
+    }
+    return ggml_escha_linear(ctx0, e.code, e.rin, e.rout, e.s_in, e.s_out, e.bias, cur);
+}
+
 std::pair<ggml_tensor *, ggml_tensor *> llama_model_qwen35::graph::build_qkvz(
                 ggml_tensor * input,
                         int   il) {
     const int64_t n_seqs       = ubatch.n_seqs;
     const int64_t n_seq_tokens = ubatch.n_seq_tokens;
 
-    ggml_tensor * qkv_mixed = build_lora_mm(model.layers[il].wqkv, input, model.layers[il].wqkv_s);
+    ggml_tensor * qkv_mixed = build_escha_mm(input, model.layers[il].escha_wqkv, model.layers[il].wqkv);
     qkv_mixed = ggml_reshape_3d(ctx0, qkv_mixed, qkv_mixed->ne[0], n_seq_tokens, n_seqs);
     cb(qkv_mixed, "linear_attn_qkv_mixed", il);
 
-    ggml_tensor * z = build_lora_mm(model.layers[il].wqkv_gate, input, model.layers[il].wqkv_gate_s);
+    ggml_tensor * z = build_escha_mm(input, model.layers[il].escha_wqkv_gate, model.layers[il].wqkv_gate);
     cb(z, "z", il);
 
     return { qkv_mixed, z };
@@ -267,7 +333,7 @@ ggml_tensor * llama_model_qwen35::graph::build_layer_attn(
     // Order: joint QG projection, QG split, Q norm, KV projection, K norm, RoPE, attention
 
     // Qwen3Next uses a single Q projection that outputs query + gate
-    ggml_tensor * Qcur_full = build_lora_mm(model.layers[il].wq, cur, model.layers[il].wq_s); // [ (n_embd_head * 2) * n_head, n_tokens ]
+    ggml_tensor * Qcur_full = build_escha_mm(cur, model.layers[il].escha_wq, model.layers[il].wq); // [ (n_embd_head * 2) * n_head, n_tokens ]
     cb(Qcur_full, "Qcur_full", il);
 
     ggml_tensor * Qcur = ggml_view_3d(ctx0, Qcur_full, n_embd_head, n_head, n_tokens,
@@ -279,10 +345,10 @@ ggml_tensor * llama_model_qwen35::graph::build_layer_attn(
     Qcur = build_norm(Qcur, model.layers[il].attn_q_norm, nullptr, LLM_NORM_RMS, il);
     cb(Qcur, "Qcur_normed", il);
 
-    ggml_tensor * Kcur = build_lora_mm(model.layers[il].wk, cur, model.layers[il].wk_s);
+    ggml_tensor * Kcur = build_escha_mm(cur, model.layers[il].escha_wk, model.layers[il].wk);
     cb(Kcur, "Kcur", il);
 
-    ggml_tensor * Vcur = build_lora_mm(model.layers[il].wv, cur, model.layers[il].wv_s);
+    ggml_tensor * Vcur = build_escha_mm(cur, model.layers[il].escha_wv, model.layers[il].wv);
     cb(Vcur, "Vcur", il);
 
     // Apply K normalization
@@ -330,7 +396,7 @@ ggml_tensor * llama_model_qwen35::graph::build_layer_attn(
     cur = ggml_mul(ctx0, cur, gate_sigmoid);
     cb(cur, "attn_gated", il);
 
-    cur = build_lora_mm(model.layers[il].wo, cur, model.layers[il].wo_s);
+    cur = build_escha_mm(cur, model.layers[il].escha_wo, model.layers[il].wo);
     cb(cur, "attn_output", il);
 
     return cur;
@@ -432,6 +498,10 @@ ggml_tensor * llama_model_qwen35::graph::build_layer_attn_linear(
     q_conv = ggml_l2_norm(ctx0, q_conv, eps_norm);
     k_conv = ggml_l2_norm(ctx0, k_conv, eps_norm);
 
+    // delta-net input scaling: q = l2norm(q) / sqrt(head_k_dim), k = l2norm(k)
+    // (vendor folds inv_scale^2 into q and inv_scale into k)
+    q_conv = ggml_scale(ctx0, q_conv, 1.0f / sqrtf((float) head_k_dim));
+
     //q_conv = ggml_cont_4d(ctx0, q_conv, head_k_dim, num_k_heads, n_seq_tokens, n_seqs);
     //k_conv = ggml_cont_4d(ctx0, k_conv, head_k_dim, num_k_heads, n_seq_tokens, n_seqs);
     //v_conv = ggml_cont_4d(ctx0, v_conv, head_v_dim, num_v_heads, n_seq_tokens, n_seqs);
@@ -461,7 +531,7 @@ ggml_tensor * llama_model_qwen35::graph::build_layer_attn_linear(
     cb(final_output, "final_output", il);
 
     // Output projection
-    cur = build_lora_mm(model.layers[il].ssm_out, final_output, model.layers[il].ssm_out_s);
+    cur = build_escha_mm(final_output, model.layers[il].escha_ssm_out, model.layers[il].ssm_out);
     cb(cur, "linear_attn_out", il);
 
     // Reshape back to original dimensions
@@ -474,12 +544,32 @@ ggml_tensor * llama_model_qwen35::graph::build_layer_ffn(ggml_tensor * cur, cons
     // Qwen3.5 does not use MoE FFN
     GGML_ASSERT(model.layers[il].ffn_gate_inp == nullptr);
 
-    cur = build_ffn(cur,
-        model.layers[il].ffn_up, NULL, model.layers[il].ffn_up_s,
-        model.layers[il].ffn_gate, NULL, model.layers[il].ffn_gate_s,
-        model.layers[il].ffn_down, NULL, model.layers[il].ffn_down_s,
-        NULL,
-        LLM_FFN_SILU, LLM_FFN_PAR, il);
+    const auto & ffn_up_e   = model.layers[il].escha_ffn_up;
+    const auto & ffn_gate_e = model.layers[il].escha_ffn_gate;
+    const auto & ffn_down_e = model.layers[il].escha_ffn_down;
+
+    if (ffn_down_e.active()) {
+        // escha path: same silu(gate)*up -> down chain, coded projections
+        ggml_tensor * up   = ggml_cont(ctx0, build_escha_mm(cur, ffn_up_e,   nullptr));
+        cb(up, "ffn_up_escha", il);
+
+        ggml_tensor * gate = ggml_cont(ctx0, build_escha_mm(cur, ffn_gate_e, nullptr));
+        gate = ggml_silu(ctx0, gate);
+        cb(gate, "ffn_gate_escha", il);
+
+        cur = ggml_mul(ctx0, gate, up);
+        cb(cur, "ffn_silu_par_escha", il);
+
+        cur = build_escha_mm(cur, ffn_down_e, nullptr);
+    } else {
+        GGML_ASSERT(model.layers[il].ffn_up && "escha layer missing both ffn paths");
+        cur = build_ffn(cur,
+            model.layers[il].ffn_up, NULL, model.layers[il].ffn_up_s,
+            model.layers[il].ffn_gate, NULL, model.layers[il].ffn_gate_s,
+            model.layers[il].ffn_down, NULL, model.layers[il].ffn_down_s,
+            NULL,
+            LLM_FFN_SILU, LLM_FFN_PAR, il);
+    }
     cb(cur, "ffn_out", il);
 
     return cur;

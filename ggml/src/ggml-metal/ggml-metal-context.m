@@ -9,6 +9,8 @@
 
 #import <Foundation/Foundation.h>
 
+#import <stdatomic.h>
+
 #import <Metal/Metal.h>
 
 #undef MIN
@@ -49,6 +51,11 @@ struct ggml_metal {
     // capture state
     int capture_compute;
     bool capture_started;
+
+    // encode profiling
+    int profile;
+    int64_t prof_tot_us;
+    int64_t prof_n;
 
     id<MTLCaptureScope> capture_scope;
 
@@ -159,6 +166,9 @@ ggml_metal_t ggml_metal_init(ggml_metal_device_t dev) {
     GGML_LOG_INFO("%s: use graph optimize = %s\n", __func__, res->use_graph_optimize ? "true" : "false");
 
     res->capture_compute = 0;
+    res->profile = getenv("GGML_METAL_PROFILE") ? atoi(getenv("GGML_METAL_PROFILE")) : 0;
+    res->prof_tot_us = 0;
+    res->prof_n = 0;
     res->capture_started = false;
     res->capture_scope = nil;
 
@@ -704,13 +714,79 @@ void ggml_metal_set_n_cb(ggml_metal_t ctx, int n_cb) {
             ctx->debug_graph,
             ctx->debug_fusion);
 
+        ggml_metal_event_t prof_ev = NULL;
+        static _Atomic uint64_t prof_op_us[GGML_OP_COUNT];
+        static _Atomic uint64_t prof_op_n[GGML_OP_COUNT];
+        static bool skip_ops[GGML_OP_COUNT];
+        if (ctx->profile == 3 && !skip_ops[1]) {
+            const char * s = getenv("GGML_METAL_SKIP_OPS");
+            if (s) {
+                char buf[512]; strncpy(buf, s, 511); buf[511] = 0;
+                char * tok = strtok(buf, ",");
+                while (tok) {
+                    for (int o = 0; o < GGML_OP_COUNT; o++) {
+                        if (strcmp(tok, ggml_op_name((enum ggml_op) o)) == 0) { skip_ops[o] = true; }
+                    }
+                    tok = strtok(NULL, ",");
+                }
+            }
+            skip_ops[1] = true; // mark initialized
+        }
+
         for (int idx = 0; idx < ggml_metal_op_n_nodes(ctx_op); ++idx) {
+            if (ctx->profile == 3) {
+                struct ggml_tensor * nd = ggml_metal_op_node(ctx_op, idx);
+                if (nd && skip_ops[nd->op]) {
+                    continue;
+                }
+            }
+            const int64_t tn0 = ctx->profile ? ggml_time_us() : 0;
             const int res = ggml_metal_op_encode(ctx_op, idx);
+            if (ctx->profile == 2 && res > 0) {
+                struct ggml_tensor * node = ggml_metal_op_node(ctx_op, idx);
+                if (node && node->op != GGML_OP_NONE && !ggml_is_empty(node)) {
+                    ggml_metal_event_encode_signal(prof_ev, ggml_metal_op_cmd_buf(ctx_op));
+                    const int64_t t1 = ggml_time_us();
+                    ggml_metal_device_event_synchronize(ctx->dev, prof_ev);
+                    const uint64_t dt = (uint64_t)(ggml_time_us() - t1);
+                    atomic_fetch_add_explicit(&prof_op_us[node->op], dt, memory_order_relaxed);
+                    atomic_fetch_add_explicit(&prof_op_n[node->op], 1, memory_order_relaxed);
+                }
+            }
+            if (ctx->profile == 1) {
+                const int64_t dt = ggml_time_us() - tn0;
+                ctx->prof_tot_us += dt;
+                ctx->prof_n++;
+                if (dt > 3000) {
+                    fprintf(stderr, "SLOWENCODE %lld us idx=%d\n", (long long)dt, idx);
+                }
+                if (ctx->prof_n % 4000 == 0) {
+                    fprintf(stderr, "PROF encode avg %.3f ms over %lld nodes\n", ctx->prof_tot_us/(double)ctx->prof_n/1000.0, (long long)ctx->prof_n);
+                    fflush(stderr);
+                    if (ctx->profile == 2) {
+                        fprintf(stderr, "PROF-OP-TABLE (us total / count):\n");
+                        for (int o = 0; o < GGML_OP_COUNT; o++) {
+                            const uint64_t us = atomic_load_explicit(&prof_op_us[o], memory_order_relaxed);
+                            const uint64_t nn = atomic_load_explicit(&prof_op_n[o], memory_order_relaxed);
+                            if (nn) {
+                                fprintf(stderr, "  %-18s %12llu us / %6llu = %8.1f us/call\n",
+                                    ggml_op_name((enum ggml_op) o), (unsigned long long) us, (unsigned long long) nn,
+                                    us/(double)nn);
+                            }
+                        }
+                        fflush(stderr);
+                    }
+                }
+            }
             if (res == 0) {
                 break;
             }
 
             idx += res - 1;
+        }
+
+        if (prof_ev) {
+            ggml_metal_device_event_free(ctx->dev, prof_ev);
         }
 
         ggml_metal_op_free(ctx_op);

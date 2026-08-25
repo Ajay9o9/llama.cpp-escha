@@ -1595,6 +1595,10 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
     GGML_ASSERT(sched);
     struct ggml_backend_sched_split * splits = sched->splits;
 
+    static int timing = -1;
+    if (timing == -1) { timing = getenv("GGML_SCHED_TIMING") ? 1 : 0; }
+    const int64_t t_all0 = timing ? ggml_time_us() : 0;
+
     ggml_tensor * prev_ids_tensor = nullptr;
     std::vector<int32_t> ids;
     std::vector<ggml_bitset_t> used_ids;
@@ -1603,6 +1607,9 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         struct ggml_backend_sched_split * split = &splits[split_id];
         int split_backend_id = split->backend_id;
         ggml_backend_t split_backend = sched->backends[split_backend_id];
+
+        const int64_t t_s0 = timing ? ggml_time_us() : 0;
+        int64_t t_copy = 0;
 
         // copy the input tensors to the split backend
         for (int input_id = 0; input_id < split->n_inputs; input_id++) {
@@ -1727,10 +1734,19 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
             }
         }
 
+        if (timing) { t_copy = ggml_time_us(); }
+
         if (!sched->callback_eval) {
             enum ggml_status ec = ggml_backend_graph_compute_async(split_backend, &split->graph);
             if (ec != GGML_STATUS_SUCCESS) {
                 return ec;
+            }
+            if (timing) {
+                const int64_t t_s1 = ggml_time_us();
+                fprintf(stderr, "SPLITTIMING split=%d backend=%-8s nodes=%d inputs=%d copy=%lldms compute+rest=%lldms\n",
+                    split_id, ggml_backend_name(split_backend), split->graph.n_nodes, split->n_inputs,
+                    (long long)(t_copy - t_s0)/1000, (long long)(t_s1 - t_copy)/1000);
+                fflush(stderr);
             }
         } else {
             // similar to ggml_backend_compare_graph_backend
@@ -1771,6 +1787,10 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
             if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
                 ggml_backend_event_record(sched->events[split_backend_id][sched->cur_copy], split_backend);
             }
+        }
+
+        if (timing) {
+            fprintf(stderr, "SPLITTIMING total wall for all splits: %lld ms\n", (long long)(ggml_time_us() - t_all0)/1000);
         }
     }
 

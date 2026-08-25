@@ -1088,6 +1088,14 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
     const bool has_simdgroup_reduction = dev->props.has_simdgroup_reduction;
     const bool has_bfloat              = dev->props.has_bfloat;
 
+    // debug: force specific op types onto CPU via GGML_METAL_DENY_OPS="MUL,ROPE,..."
+    {
+        const char * deny = getenv("GGML_METAL_DENY_OPS");
+        if (deny && strstr(deny, ggml_op_desc(op))) {
+            return false;
+        }
+    }
+
     if (!has_bfloat) {
         if (op->type == GGML_TYPE_BF16) {
             return false;
@@ -1382,6 +1390,25 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
         case GGML_OP_RWKV_WKV6:
         case GGML_OP_RWKV_WKV7:
             return true;
+        case GGML_OP_ESCHA_LINEAR:
+            {
+                static int dbg_cnt = 0;
+                if (dbg_cnt++ < 8) {
+                    GGML_LOG_INFO("%s: ESCHA_LINEAR probe #%d -> %d (n_code=%lld, IC=%lld, OC=%lld, M=%lld)\n",
+                        __func__, dbg_cnt, (int)(has_simdgroup_reduction &&
+                            op->src[6]->type == GGML_TYPE_F32 &&
+                            op->type         == GGML_TYPE_F32 &&
+                            ggml_is_contiguous_rows(op->src[6]) &&
+                            ggml_is_contiguous_rows(op)),
+                        (long long)op->src[0]->ne[0], (long long)op->src[0]->ne[2]*16,
+                        (long long)op->src[0]->ne[1]*16, (long long)op->ne[1]);
+                }
+                return has_simdgroup_reduction &&
+                    op->src[6]->type == GGML_TYPE_F32 &&
+                    op->type         == GGML_TYPE_F32 &&
+                    ggml_is_contiguous_rows(op->src[6]) &&
+                    ggml_is_contiguous_rows(op);
+            }
         case GGML_OP_GATED_DELTA_NET:
             return has_simdgroup_reduction && op->src[2]->ne[0] % 32 == 0;
         case GGML_OP_SOLVE_TRI:
@@ -1723,8 +1750,26 @@ ggml_metal_buffer_t ggml_metal_buffer_map(ggml_metal_device_t dev, void * ptr, s
 
     const struct ggml_metal_device_props * props_dev = ggml_metal_device_get_props(dev);
 
+    // cap the size of a single BytesNoCopy mapping: very large spans (e.g. an
+    // mmap region covering a whole model file section) can approach the unified
+    // memory wired limit and fail later in command-buffer validation with
+    // kIOGPUCommandBufferCallbackErrorOutOfMemory, even though each kernel only
+    // touches a small subrange. Split into smaller overlapping views instead.
+    // NOTE: each view must still fully contain the largest tensor, so the cap
+    // can never go below max_tensor_size (+ page slack).
+    const size_t ovlp_min = ((max_tensor_size + size_page - 1) / size_page + 3) * size_page;
+    size_t max_view = props_dev->max_buffer_size;
+    {
+        const char * cap = getenv("GGML_METAL_MAPPED_CAP_MB");
+        size_t def_cap = 4ULL * 1024 * 1024 * 1024; // 4 GiB
+        size_t v = cap ? (size_t) atoi(cap) * 1024 * 1024 : def_cap;
+        if (v > ovlp_min && v < max_view) {
+            max_view = v;
+        }
+    }
+
     // the buffer fits into the max buffer size allowed by the device
-    if (size_aligned <= props_dev->max_buffer_size) {
+    if (size_aligned <= max_view) {
         res->buffers[res->n_buffers].data  = ptr;
         res->buffers[res->n_buffers].size  = size;
         res->buffers[res->n_buffers].metal = nil;
@@ -1746,8 +1791,8 @@ ggml_metal_buffer_t ggml_metal_buffer_map(ggml_metal_device_t dev, void * ptr, s
         // this overlap between the views will guarantee that the tensor with the maximum size will fully fit into
         // one of the views
         const size_t size_ovlp = ((max_tensor_size + size_page - 1) / size_page + 1) * size_page; // round-up 2 pages just in case
-        const size_t size_step = props_dev->max_buffer_size - size_ovlp;
-        const size_t size_view = props_dev->max_buffer_size;
+        const size_t size_step = max_view - size_ovlp;
+        const size_t size_view = max_view;
 
         for (size_t i = 0; i < size; i += size_step) {
             const size_t size_step_aligned = (i + size_view <= size) ? size_view : (size_aligned - i);
@@ -2008,9 +2053,14 @@ struct ggml_metal_buffer_id ggml_metal_buffer_get_id(ggml_metal_buffer_t buf, co
     const int64_t tsize = ggml_nbytes(t);
 
     // find the view that contains the tensor fully
+    const int dbg_ranges = getenv("GGML_METAL_BIN_TRACE") ? 1 : 0;
     for (int i = 0; i < buf->n_buffers; ++i) {
         const int64_t ioffs = (int64_t) t->data - (int64_t) buf->buffers[i].data;
 
+        if (dbg_ranges && t->name) {
+            fprintf(stderr, "GETID '%s' view=%d/%d ioffs=%lld tsize=%lld view.size=%lld\n",
+                    t->name, i, buf->n_buffers, (long long)ioffs, (long long)tsize, (long long)buf->buffers[i].size);
+        }
         //GGML_LOG_INFO("ioffs = %10ld, tsize = %10ld, sum = %10ld, buf->buffers[%d].size = %10ld\n", ioffs, tsize, ioffs + tsize, i, buf->buffers[i].size);
         if (ioffs >= 0 && ioffs + tsize <= (int64_t) buf->buffers[i].size) {
             res.metal = buf->buffers[i].metal;

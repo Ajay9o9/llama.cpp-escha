@@ -334,6 +334,18 @@ struct llama_layer {
     llm_escha_exps ffn_up_escha;
     llm_escha_exps ffn_down_escha;
 
+    // dense linears kept in the escha 2-bit code (qwen3_5 escha export)
+    llm_escha_dense escha_wq;
+    llm_escha_dense escha_wk;
+    llm_escha_dense escha_wv;
+    llm_escha_dense escha_wo;
+    llm_escha_dense escha_wqkv;
+    llm_escha_dense escha_wqkv_gate;
+    llm_escha_dense escha_ssm_out;
+    llm_escha_dense escha_ffn_gate;
+    llm_escha_dense escha_ffn_up;
+    llm_escha_dense escha_ffn_down;
+
     // ff MoE per-expert scales (NVFP4 per-tensor scale2)
     struct ggml_tensor * ffn_gate_exps_s   = nullptr;
     struct ggml_tensor * ffn_down_exps_s   = nullptr;

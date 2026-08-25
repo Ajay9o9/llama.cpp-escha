@@ -22,7 +22,10 @@ ggml_metal_op_t ggml_metal_op_init(
 
 void ggml_metal_op_free(ggml_metal_op_t ctx);
 
-int ggml_metal_op_n_nodes(ggml_metal_op_t ctx);
+int      ggml_metal_op_n_nodes(ggml_metal_op_t ctx);
+struct ggml_tensor * ggml_metal_op_node    (ggml_metal_op_t ctx, int idx);
+ggml_metal_cmd_buf_t ggml_metal_op_cmd_buf (ggml_metal_op_t ctx);
+ggml_metal_device_t  ggml_metal_op_dev     (ggml_metal_op_t ctx);
 
 int ggml_metal_op_encode(ggml_metal_op_t ctx, int idx);
 
@@ -60,6 +63,7 @@ int ggml_metal_op_soft_max          (ggml_metal_op_t ctx, int idx);
 int ggml_metal_op_ssm_conv          (ggml_metal_op_t ctx, int idx);
 int ggml_metal_op_ssm_scan          (ggml_metal_op_t ctx, int idx);
 int ggml_metal_op_rwkv              (ggml_metal_op_t ctx, int idx);
+int ggml_metal_op_escha_linear      (ggml_metal_op_t ctx, int idx);
 int ggml_metal_op_gated_delta_net   (ggml_metal_op_t ctx, int idx);
 int ggml_metal_op_solve_tri         (ggml_metal_op_t ctx, int idx);
 int ggml_metal_op_set               (ggml_metal_op_t ctx, int idx);
