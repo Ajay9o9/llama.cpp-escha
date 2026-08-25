@@ -14,6 +14,8 @@
 #include <future>
 #include <regex>
 
+#include <set>
+
 static const size_t kiB = 1024;
 static const size_t MiB = 1024*kiB;
 static const size_t GiB = 1024*MiB;
@@ -973,6 +975,32 @@ static bool weight_buft_supported(const llama_hparams & hparams, ggml_tensor * w
                 ggml_tensor * ids = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_ids, 512);
                 op_tensor = ggml_escha_moe(ctx, code, rin, rout, lut, dep, b, ids);
             } break;
+        case GGML_OP_ESCHA_LINEAR:
+            {
+                GGML_ASSERT(suffix != nullptr);
+
+                const bool is_code = strcmp(suffix, "escha_code") == 0;
+                const bool is_rin  = strcmp(suffix, "escha_rin")  == 0;
+                const bool is_rout = strcmp(suffix, "escha_rout") == 0;
+                const bool is_sin  = strcmp(suffix, "escha_s_in")  == 0;
+                const bool is_sout = strcmp(suffix, "escha_s_out") == 0;
+                const bool is_bias = strcmp(suffix, "escha_bias") == 0;
+
+                // dimensions w does not pin down get a shape the op accepts
+                const int64_t n_code = is_code ? w->ne[0] : 32;
+                const int64_t IC     = is_code ? w->ne[2]*16 : (is_rin || is_sin ? w->ne[0] : 2048);
+                const int64_t OC     = is_code ? w->ne[1]*16 : ((is_rout || is_sout || is_bias) ? w->ne[0] : 512);
+
+                ggml_tensor * code = is_code ? w : ggml_new_tensor_3d(ctx, GGML_TYPE_I16, n_code, OC/16, IC/16);
+                ggml_tensor * rin  = is_rin  ? w : ggml_new_tensor_1d(ctx, GGML_TYPE_F16, IC);
+                ggml_tensor * rout = is_rout ? w : ggml_new_tensor_1d(ctx, GGML_TYPE_F16, OC);
+                ggml_tensor * sin_ = is_sin  ? w : ggml_new_tensor_1d(ctx, GGML_TYPE_F32, IC);
+                ggml_tensor * sout = is_sout ? w : ggml_new_tensor_1d(ctx, GGML_TYPE_F32, OC);
+                ggml_tensor * bias = is_bias ? w : ggml_new_tensor_1d(ctx, GGML_TYPE_F16, OC);
+                ggml_tensor * b    = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, IC, 512);
+
+                op_tensor = ggml_escha_linear(ctx, code, rin, rout, sin_, sout, bias, b);
+            } break;
         case GGML_OP_ADD:
             {
                 ggml_tensor * a = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, w->ne[0], w->ne[1], w->ne[2], w->ne[3]);
@@ -1159,7 +1187,9 @@ struct ggml_tensor * llama_model_loader::create_tensor(
         // rather than the MUL_MAT_ID declared for the exps they hang off
         ggml_op op;
         if (tn.suffix != nullptr && strncmp(tn.suffix, "escha_", 6) == 0) {
-            op = GGML_OP_ESCHA_MOE;
+            // routed experts ride the MoE op; dense linears get their own op
+            const bool escha_moe_arch = get_arch_name().find("moe") != std::string::npos;
+            op = escha_moe_arch ? GGML_OP_ESCHA_MOE : GGML_OP_ESCHA_LINEAR;
         } else if (tn.suffix != nullptr && strcmp(tn.suffix, "bias") == 0) {
             op = info.op == GGML_OP_MUL_MAT_ID ? GGML_OP_ADD_ID : GGML_OP_ADD;
         } else if (hparams.router_layer >= 0 && tn.suffix != nullptr &&
@@ -1171,7 +1201,8 @@ struct ggml_tensor * llama_model_loader::create_tensor(
 
         // the escha probe needs to know which slot this tensor fills; the shared codec
         // tables carry no suffix, so fall back to their bare name
-        const char * escha_role = op == GGML_OP_ESCHA_MOE
+        const bool escha_op = op == GGML_OP_ESCHA_MOE || op == GGML_OP_ESCHA_LINEAR;
+        const char * escha_role = escha_op
             ? (tn.suffix ? tn.suffix : ggml_get_name(t_meta))
             : nullptr;
 

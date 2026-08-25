@@ -635,6 +635,32 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_rwkv(ggml_metal_
     return res;
 }
 
+ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_escha_linear(ggml_metal_library_t lib, const ggml_tensor * op) {
+    char base[256];
+
+    const int64_t n_code = op->src[0]->ne[0];
+    GGML_ASSERT(n_code == 32 || n_code == 48); // 16*K int16 per tile, K = 2 or 3
+
+    // wide variant: one threadgroup covers 4 consecutive 128-output blocks
+    // (contiguous code reads); requires OC to be a multiple of 512
+    // wide variants: one threadgroup covers NB consecutive 128-output blocks
+    // (contiguous code reads); require OC multiples accordingly
+    const int64_t tn = op->src[0]->ne[1];
+    const char * suffix = (tn % 32) == 0 ? "_nb4" : ((tn % 16) == 0 ? "_nb2" : "");
+    const int nbs = (tn % 32) == 0 ? 4 : ((tn % 16) == 0 ? 2 : 1);
+
+    snprintf(base, 256, "kernel_escha_linear_k%lld%s", n_code/16, suffix);
+
+    ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, base);
+    if (!res.pipeline) {
+        res = ggml_metal_library_compile_pipeline(lib, base, base, nullptr);
+    }
+
+    res.smem = (1024 + 128*nbs)*sizeof(float); // staging chunk + output accumulators
+
+    return res;
+}
+
 ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_gated_delta_net(ggml_metal_library_t lib, const ggml_tensor * op) {
     char base[256];
     char name[256];

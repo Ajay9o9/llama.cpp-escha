@@ -417,7 +417,17 @@ static size_t ggml_backend_metal_buffer_type_mapped_get_alignment(ggml_backend_b
 static size_t ggml_backend_metal_buffer_type_mapped_get_max_size(ggml_backend_buffer_type_t buft) {
     ggml_metal_device_t ctx_dev = (ggml_metal_device_t)buft->device->context;
 
-    return ggml_metal_device_get_props(ctx_dev)->max_buffer_size;
+    size_t sz = ggml_metal_device_get_props(ctx_dev)->max_buffer_size;
+    // cap mapped views so a single BytesNoCopy reservation cannot approach the
+    // unified-memory wired limit (large spans otherwise fail in command buffers)
+    const char * cap = getenv("GGML_METAL_MAPPED_CAP_MB");
+    if (cap) {
+        size_t v = (size_t) atoi(cap) * 1024 * 1024;
+        if (v > 0 && v < sz) {
+            sz = v;
+        }
+    }
+    return sz;
 }
 
 static size_t ggml_backend_metal_buffer_type_mapped_get_alloc_size(ggml_backend_buffer_type_t buft, const ggml_tensor * tensor) {

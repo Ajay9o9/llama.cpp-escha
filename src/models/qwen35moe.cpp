@@ -495,6 +495,10 @@ ggml_tensor * llama_model_qwen35moe::graph::build_layer_attn_linear(
     q_conv = ggml_l2_norm(ctx0, q_conv, eps_norm);
     k_conv = ggml_l2_norm(ctx0, k_conv, eps_norm);
 
+    // delta-net input scaling: q = l2norm(q) / sqrt(head_k_dim), k = l2norm(k)
+    // (vendor folds inv_scale^2 into q and inv_scale into k)
+    q_conv = ggml_scale(ctx0, q_conv, 1.0f / sqrtf((float) head_k_dim));
+
     //q_conv = ggml_cont_4d(ctx0, q_conv, head_k_dim, num_k_heads, n_seq_tokens, n_seqs);
     //k_conv = ggml_cont_4d(ctx0, k_conv, head_k_dim, num_k_heads, n_seq_tokens, n_seqs);
     //v_conv = ggml_cont_4d(ctx0, v_conv, head_v_dim, num_v_heads, n_seq_tokens, n_seqs);

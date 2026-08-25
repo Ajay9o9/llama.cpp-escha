@@ -38,6 +38,7 @@ struct ggml_metal_op {
         int  debug_graph,
         int  debug_fusion) {
         this->dev             = dev;
+        this->cmd_buf         = cmd_buf;
         this->lib             = ggml_metal_device_get_library(dev);
         this->enc             = ggml_metal_encoder_init(cmd_buf, use_concurrency);
         this->mem_ranges      = ggml_mem_ranges_init(debug_graph);
@@ -91,6 +92,7 @@ struct ggml_metal_op {
     ggml_metal_device_t  dev;
     ggml_metal_library_t lib;
     ggml_metal_encoder_t enc;
+    ggml_metal_cmd_buf_t cmd_buf;
     ggml_mem_ranges_t    mem_ranges;
 
     bool use_fusion;
@@ -142,6 +144,18 @@ void ggml_metal_op_free(ggml_metal_op_t ctx) {
 
 int ggml_metal_op_n_nodes(ggml_metal_op_t ctx) {
     return ctx->n_nodes();
+}
+
+struct ggml_tensor * ggml_metal_op_node(ggml_metal_op_t ctx, int idx) {
+    return ctx->node(idx);
+}
+
+ggml_metal_cmd_buf_t ggml_metal_op_cmd_buf(ggml_metal_op_t ctx) {
+    return ctx->cmd_buf;
+}
+
+ggml_metal_device_t ggml_metal_op_dev(ggml_metal_op_t ctx) {
+    return ctx->dev;
 }
 
 static bool ggml_metal_op_concurrency_reset(ggml_metal_op_t ctx) {
@@ -346,6 +360,10 @@ static int ggml_metal_op_encode_impl(ggml_metal_op_t ctx, int idx) {
         case GGML_OP_RWKV_WKV7:
             {
                 n_fuse = ggml_metal_op_rwkv(ctx, idx);
+            } break;
+        case GGML_OP_ESCHA_LINEAR:
+            {
+                n_fuse = ggml_metal_op_escha_linear(ctx, idx);
             } break;
         case GGML_OP_GATED_DELTA_NET:
             {
@@ -1806,6 +1824,81 @@ int ggml_metal_op_rwkv(ggml_metal_op_t ctx, int idx) {
     ggml_metal_encoder_set_bytes   (enc, (void *) &H, sizeof(H), ida++);
 
     ggml_metal_encoder_dispatch_threadgroups(enc, B * H, 1, 1, C/H, 1, 1);
+
+    return 1;
+}
+
+int ggml_metal_op_escha_linear(ggml_metal_op_t ctx, int idx) {
+    ggml_tensor * op = ctx->node(idx);
+
+    static int dbg_calls = 0;
+    if (++dbg_calls <= 8 || dbg_calls % 256 == 0) {
+        GGML_LOG_INFO("%s: metal escha call #%d (OC=%lld M=%lld)\n", __func__, dbg_calls,
+            (long long)op->src[0]->ne[1]*16, (long long)op->src[6]->ne[1]);
+    }
+
+    ggml_metal_encoder_t enc = ctx->enc;
+
+    auto pipeline = ggml_metal_library_get_pipeline_escha_linear(ctx->lib, op);
+
+    const uint32_t IC = op->src[0]->ne[2]*16;
+    const uint32_t OC = op->src[0]->ne[1]*16;
+    const uint32_t M  = op->src[6]->ne[1];
+
+    // must match the getter's wide-variant conditions (OC tile-count multiples)
+    const uint32_t ntiles = op->src[0]->ne[1];
+    const uint32_t nb = (ntiles % 32u) == 0u ? 4u : (((ntiles % 16u) == 0u) ? 2u : 1u);
+
+    const uint64_t xs = op->src[6]->nb[1]/4; // floats
+    const uint64_t ds = op->nb[1]/4;         // floats
+
+    const int dbg = getenv("GGML_ESCHA_DBG") ? atoi(getenv("GGML_ESCHA_DBG")) : 0;
+
+    static int perf_on = -1;
+    static int perf_n = 0;
+    static double perf_tot_ms = 0, perf_max_ms = 0;
+    if (perf_on == -1) {
+        perf_on = getenv("GGML_ESCHA_PERF") ? atoi(getenv("GGML_ESCHA_PERF")) : 0;
+    }
+
+    int ida = 0;
+
+    ggml_metal_encoder_set_pipeline(enc, pipeline);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[0]), ida++); // code
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[1]), ida++); // rin
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[2]), ida++); // rout
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[3]), ida++); // s_in
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[4]), ida++); // s_out
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[5]), ida++); // bias
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[6]), ida++); // x
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op),         ida++); // dst
+    ggml_metal_encoder_set_bytes   (enc, (void *) &IC, sizeof(IC), ida++);
+    ggml_metal_encoder_set_bytes   (enc, (void *) &OC, sizeof(OC), ida++);
+    ggml_metal_encoder_set_bytes   (enc, (void *) &M,  sizeof(M),  ida++);
+    ggml_metal_encoder_set_bytes   (enc, (void *) &xs, sizeof(xs), ida++);
+    ggml_metal_encoder_set_bytes   (enc, (void *) &ds, sizeof(ds), ida++);
+    ggml_metal_encoder_set_bytes   (enc, (void *) &dbg, sizeof(dbg), ida++);
+
+    ggml_metal_encoder_set_threadgroup_memory_size(enc, (1024 + 128*nb)*sizeof(float), 0);
+
+    ggml_metal_encoder_dispatch_threadgroups(enc, OC/(128*nb), M, 1, 256, 1, 1);
+
+    if (perf_on) {
+        ggml_metal_event_t ev = ggml_metal_device_event_init(ctx->dev);
+        ggml_metal_event_encode_signal(ev, ctx->cmd_buf);
+        const int64_t t0 = ggml_time_us();
+        ggml_metal_device_event_synchronize(ctx->dev, ev);
+        const double ms = (ggml_time_us() - t0)/1000.0;
+        ggml_metal_device_event_free(ctx->dev, ev);
+        perf_n++;
+        perf_tot_ms += ms;
+        if (ms > perf_max_ms) { perf_max_ms = ms; }
+        if (perf_n % 400 == 0) {
+            GGML_LOG_INFO("%s: PERF %d calls avg %.3f ms max %.3f ms (OC=%u M=%u this call)\n",
+                __func__, perf_n, perf_tot_ms/perf_n, perf_max_ms, OC, M);
+            fflush(stderr);
+        }
+    }
 
     return 1;
 }
@@ -3389,10 +3482,29 @@ static bool ggml_metal_op_can_fuse_snake(ggml_metal_op_t ctx, int idx) {
 
 int ggml_metal_op_bin(ggml_metal_op_t ctx, int idx) {
     if (ctx->use_fusion && ggml_metal_op_can_fuse_snake(ctx, idx)) {
+        if (getenv("GGML_METAL_BIN_TRACE")) {
+            fprintf(stderr, "BIN_SNAKE idx=%d node=%s\n", idx, ctx->node(idx)->name ? ctx->node(idx)->name : "?");
+        }
         return ggml_metal_op_snake_fused(ctx, idx);
     }
 
     ggml_tensor * op = ctx->node(idx);
+
+    if (getenv("GGML_METAL_BIN_TRACE")) {
+        ggml_metal_buffer_id b0 = ggml_metal_get_buffer_id(op->src[0]);
+        ggml_metal_buffer_id b1 = ggml_metal_get_buffer_id(op->src[1]);
+        ggml_metal_buffer_id bd = ggml_metal_get_buffer_id(op);
+        size_t s0 = op->src[0] ? ggml_nbytes(op->src[0]) : 0;
+        size_t s1 = op->src[1] ? ggml_nbytes(op->src[1]) : 0;
+        size_t sd = ggml_nbytes(op);
+        fprintf(stderr, "BIN idx=%d op=%s name=%s ne=[%lld,%lld,%lld,%lld] src1=[%lld,%lld,%lld,%lld]\n",
+                idx, ggml_op_desc(op), op->name ? op->name : "?",
+                (long long)op->ne[0], (long long)op->ne[1], (long long)op->ne[2], (long long)op->ne[3],
+                (long long)(op->src[1] ? op->src[1]->ne[0] : 0), (long long)(op->src[1] ? op->src[1]->ne[1] : 0),
+                (long long)(op->src[1] ? op->src[1]->ne[2] : 0), (long long)(op->src[1] ? op->src[1]->ne[3] : 0));
+        fprintf(stderr, "   buf src0 offs=%zu need=%zu | src1 offs=%zu need=%zu | dst offs=%zu need=%zu\n",
+                b0.offs, s0, b1.offs, s1, bd.offs, sd);
+    }
 
     ggml_metal_library_t lib = ctx->lib;
     ggml_metal_encoder_t enc = ctx->enc;

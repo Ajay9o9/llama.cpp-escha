@@ -10797,19 +10797,19 @@ static void ggml_compute_forward_gated_delta_net_one_chunk(
 
     const float * state_in_base = (const float *)src_state->data;
 
-  //const int64_t rq1 = nev1 / neq1;
-  //const int64_t rk1 = nev1 / nek1;
     const int64_t rq3 = nev3 / neq3;
     const int64_t rk3 = nev3 / nek3;
-
-    const float scale = 1.0f / sqrtf((float) S_v);
 
     for (int64_t ir = ir0; ir < ir1; ++ir) {
         const int64_t iv1 = ir % H; // head_index
         const int64_t iv3 = ir / H; // sequence
 
-        const int64_t iq1 = iv1 % neq1;
-        const int64_t ik1 = iv1 % nek1;
+        // group-query style BLOCK mapping: consecutive v-heads share a k-head
+        // (vendor: hk = hv / (Hv/Hk)); modulo mapping scrambles head pairing
+        const int64_t rq1 = nev1 / neq1;
+        const int64_t rk1 = nev1 / nek1;
+        const int64_t iq1 = iv1 / rq1;
+        const int64_t ik1 = iv1 / rk1;
 
         const int64_t iq3 = iv3 / rq3;
         const int64_t ik3 = iv3 / rk3;
@@ -10865,10 +10865,12 @@ static void ggml_compute_forward_gated_delta_net_one_chunk(
             }
 
             // attn_out[j] = sum_i S[i][j] * q[i] = dot(row j of M, q)
+            // note: no extra 1/sqrt(Dk) here; the input-side scaling convention
+            // (q normalized and folded with inv_scale^2) fully determines magnitude
             for (int64_t j = 0; j < S_v; ++j) {
                 float sum = 0.0f;
                 ggml_vec_dot_f32(S_v, &sum, 0, &s_out[j * S_v], 0, q_d, 0, 1);
-                attn_data[j] = sum * scale;
+                attn_data[j] = sum;
             }
 
             attn_data += S_v * H; // advance to next token
@@ -11375,6 +11377,145 @@ void ggml_compute_forward_escha_moe(
         float * dr_ = (float *)((char *) dst->data + is*dst->nb[1] + it*dst->nb[2]);
         for (int64_t c = 0; c < OC; ++c) {
             dr_[c] = acc[c]*GGML_CPU_FP16_TO_FP32(rout_e[c]);
+        }
+    }
+}
+
+// ggml_compute_forward_escha_linear
+//
+// dense sibling of the routed op, decoded through the same closed-form lane
+// arithmetic the numpy reference uses (no dep table needed):
+//   y = T128(T128(x * s_in * rin) @ decode(code)) * rout * s_out + bias
+
+static inline void ggml_escha_decode_tile_cf(
+        const uint16_t * payload,
+        const int        K,
+        float *          tile) {      // [256] row-major [r][c]
+    // codebook A, same integer hash as the routed op
+    auto cb = [](uint32_t idx) -> float {
+        const uint32_t x = ((idx*0xcbac1fedu) & 0x8fff8fffu) ^ 0x3b603b60u;
+        ggml_fp16_t lo, hi;
+        memcpy(&lo, (const char *) &x,     sizeof(lo));
+        memcpy(&hi, (const char *) &x + 2, sizeof(hi));
+        const float v = GGML_CPU_FP16_TO_FP32(lo) + GGML_CPU_FP16_TO_FP32(hi);
+        return GGML_CPU_FP16_TO_FP32(GGML_CPU_FP32_TO_FP16(v));
+    };
+
+    const uint32_t * w32 = (const uint32_t *) payload;
+    const int n_words = K == 2 ? 16 : 24;
+
+    for (int lane = 0; lane < 32; ++lane) {
+        uint16_t st[8];
+
+        if (K == 2) {
+            const int t_off = lane*8;
+            const int i1    = t_off >> 4;
+            const int i0    = (i1 + 15) & 15;
+            const uint64_t merged = ((uint64_t) w32[i0] << 32) | w32[i1];
+            const uint32_t w      = (uint32_t)(merged >> (uint32_t)(((~t_off) & 8) << 1));
+            for (int j = 0; j < 8; ++j) {
+                st[j] = (uint16_t)((w >> (2*(7 - j))) & 0xFFFF);
+            }
+        } else {
+            const int t_off = lane*8;
+            const int b1    = (t_off + 257)*3;
+            const int b2    = b1 + 21;
+            const int i0    = ((b1 - 16) >> 5) % n_words;
+            const int i2w   = ((b2 - 1) >> 5) % n_words;
+            const int s2    = ((((b2 - 1) >> 5) + 1) << 5) - b2;
+            const uint64_t merged = ((uint64_t) w32[i0] << 32) | w32[i2w];
+            const uint32_t w7 = (uint32_t)(merged >> s2);
+            const uint32_t w3 = (uint32_t)(merged >> (s2 + 12));
+            static const uint32_t sh[4] = { 9, 6, 3, 0 };
+            for (int j = 0; j < 4; ++j) st[j]     = (uint16_t)((w3 >> sh[j]) & 0xFFFF);
+            for (int j = 0; j < 4; ++j) st[4 + j] = (uint16_t)((w7 >> sh[j]) & 0xFFFF);
+        }
+
+        // the eight (row, col) cells this lane owns, in value order
+        const int l0    = lane & ~4;
+        const int c_off = (lane >> 2) & 1;
+        for (int j = 0; j < 8; ++j) {
+            const int fi  = j >> 1;
+            const int row = (lane & 3)*2 + (j & 1) + (fi & 1)*8;
+            const int col = 2*((l0 >> 3) + (j >= 4 ? 4 : 0)) + c_off;
+            tile[row*16 + col] = cb(st[j]);
+        }
+    }
+}
+
+void ggml_compute_forward_escha_linear(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+    const ggml_tensor * code = dst->src[0];
+    const ggml_tensor * rin  = dst->src[1];
+    const ggml_tensor * rout = dst->src[2];
+    const ggml_tensor * s_in = dst->src[3];
+    const ggml_tensor * s_out= dst->src[4];
+    const ggml_tensor * bias = dst->src[5];
+    const ggml_tensor * x    = dst->src[6];
+
+    const int64_t nct = code->ne[1];        // output tiles
+    const int64_t nit = code->ne[2];        // input tiles
+    const int64_t OC  = nct*16;
+    const int64_t IC  = nit*16;
+    const int64_t n_code = code->ne[0];
+    const int K = n_code == 32 ? 2 : 3;
+
+    const int16_t     * code_d = (const int16_t *)     code->data;
+    const ggml_fp16_t * rin_d  = (const ggml_fp16_t *) rin->data;
+    const ggml_fp16_t * rout_d = (const ggml_fp16_t *) rout->data;
+    const float       * sin_d  = (const float *)       s_in->data;
+    const float       * sout_d = (const float *)       s_out->data;
+    const ggml_fp16_t * bias_d = (const ggml_fp16_t *) bias->data;
+
+    const int64_t nrows = x->ne[1];
+
+    // one thread takes a contiguous slab of rows
+    const int64_t dr = (nrows + params->nth - 1)/params->nth;
+    const int64_t r0 = dr*params->ith;
+    const int64_t r1 = MIN(r0 + dr, nrows);
+
+    float * wdata = (float *) params->wdata + (IC + OC + 256)*params->ith;
+    float * u     = wdata;
+    float * acc   = u   + IC;
+    float * tile  = acc + OC;
+
+    for (int64_t r = r0; r < r1; ++r) {
+        const float * xr = (const float *)((const char *) x->data + r*x->nb[1]);
+
+        for (int64_t i = 0; i < IC; ++i) {
+            u[i] = xr[i]*sin_d[i]*GGML_CPU_FP16_TO_FP32(rin_d[i]);
+        }
+        ggml_escha_hadamard_128(u, IC);
+
+        memset(acc, 0, OC*sizeof(float));
+
+        for (int64_t i = 0; i < nit; ++i) {
+            const float * ub = u + i*16;
+
+            for (int64_t j = 0; j < nct; ++j) {
+                ggml_escha_decode_tile_cf((const uint16_t *)(code_d + (i*nct + j)*n_code), K, tile);
+
+                float * ab = acc + j*16;
+                for (int rr = 0; rr < 16; ++rr) {
+                    const float ur = ub[rr];
+                    if (ur == 0.0f) {
+                        continue;
+                    }
+                    const float * tr = tile + rr*16;
+                    for (int c = 0; c < 16; ++c) {
+                        ab[c] += ur*tr[c];
+                    }
+                }
+            }
+        }
+
+        ggml_escha_hadamard_128(acc, OC);
+
+        float * dr_ = (float *)((char *) dst->data + r*dst->nb[1]);
+        for (int64_t c = 0; c < OC; ++c) {
+            dr_[c] = acc[c]*GGML_CPU_FP16_TO_FP32(rout_d[c])*sout_d[c]
+                     + GGML_CPU_FP16_TO_FP32(bias_d[c]);
         }
     }
 }

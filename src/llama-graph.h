@@ -28,6 +28,19 @@ struct llm_escha_exps {
     bool active() const { return code != nullptr; }
 };
 
+// the escha side of one dense linear: the coded weight plus the dense-only
+// per-channel corrections and bias that the routed experts do not carry
+struct llm_escha_dense {
+    struct ggml_tensor * code  = nullptr;
+    struct ggml_tensor * rin   = nullptr;
+    struct ggml_tensor * rout  = nullptr;
+    struct ggml_tensor * s_in  = nullptr;
+    struct ggml_tensor * s_out = nullptr;
+    struct ggml_tensor * bias  = nullptr;
+
+    bool active() const { return code != nullptr; }
+};
+
 // the escha side of one MoE block: the shared codec tables plus the three projections
 struct llm_escha_moe {
     struct ggml_tensor * lut    = nullptr;

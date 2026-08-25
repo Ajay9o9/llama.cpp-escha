@@ -1587,7 +1587,32 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         bool is_default_buft = buft == ggml_backend_dev_buffer_type(dev);
 
         std::vector<ggml_backend_buffer_ptr> bufs;
-        if (ml.use_mmap && use_mmap_buffer && buffer_from_host_ptr_supported && is_default_buft) {
+        // decide whether wrapping the mmap region is worthwhile: if the span
+        // [first .. last] of this context's tensors is much larger than the
+        // tensors themselves (GPU tensors stranded far apart in the file, with
+        // CPU-only weights in between), a BytesNoCopy mapping would reserve the
+        // whole span against the unified-memory wired limit for no benefit.
+        bool mmap_wrap_ok = ml.use_mmap && use_mmap_buffer && buffer_from_host_ptr_supported && is_default_buft;
+        if (mmap_wrap_ok) {
+            size_t first = 0, last = 0, sum_bytes = 0;
+            void * addr_unused = nullptr;
+            for (uint32_t idx = 0; idx < ml.files.size(); idx++) {
+                ml.get_mapping_range(&first, &last, &addr_unused, idx, ctx);
+                if (first >= last) {
+                    continue;
+                }
+                for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+                    sum_bytes += ggml_nbytes(t);
+                }
+                if (last - first > sum_bytes + 64*1024*1024) { // >64MiB of stranded gap
+                    LLAMA_LOG_INFO("%s: mmap span (%zu MiB) >> tensor bytes (%zu MiB) for %s; using a real allocation instead\n",
+                            __func__, (last - first)/(1024*1024), sum_bytes/(1024*1024), ggml_backend_buft_name(buft));
+                    mmap_wrap_ok = false;
+                }
+                break; // span check on the primary file is sufficient
+            }
+        }
+        if (mmap_wrap_ok) {
             GGML_ASSERT(!ml.no_alloc);
             for (uint32_t idx = 0; idx < ml.files.size(); idx++) {
                 // only the mmap region containing the tensors in the model is mapped to the backend buffer

@@ -2145,6 +2145,12 @@ struct llama_model_qwen35 : public llama_model_base {
     struct graph : public llm_build_delta_net_base {
         graph(const llama_model & model, const llm_graph_params & params);
     private:
+        // escha-coded dense projection, or the stock matmul when absent
+        ggml_tensor * build_escha_mm(
+                    ggml_tensor * cur,
+            const llm_escha_dense & e,
+                    ggml_tensor * w);
+
         ggml_tensor * build_layer_attn(
         llm_graph_input_attn_kv * inp_attn,
                     ggml_tensor * cur,

@@ -337,6 +337,9 @@ endif()
 # needs a case file generated from the escha checkpoint, so build only
 llama_build(test-escha-moe.cpp)
 
+# golden cases come from tools/escha-dump-linear-cases.py, so build only
+llama_build(test-escha-linear.cpp)
+
 llama_build(test-export-graph-ops.cpp)
 if (TARGET gguf-model-data)
     target_link_libraries(test-export-graph-ops PRIVATE gguf-model-data)

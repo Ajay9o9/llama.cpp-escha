@@ -575,6 +575,7 @@ extern "C" {
         GGML_OP_DSV4_HC_PRE,
         GGML_OP_DSV4_HC_POST,
         GGML_OP_ESCHA_MOE,
+        GGML_OP_ESCHA_LINEAR,
 
         GGML_OP_UNARY,
 
@@ -2613,6 +2614,31 @@ extern "C" {
             struct ggml_tensor  * dep,
             struct ggml_tensor  * x,
             struct ggml_tensor  * ids);
+
+    // fused decode + dense matmul for Escha ESCHAM linears (non-routed)
+    //
+    // same tile decode and rotations as the routed op, with the dense-only
+    // per-channel corrections and bias folded in:
+    //
+    //   y = T128(T128(x * s_in * rin) @ decode(code)) * rout * s_out + bias
+    //
+    //   code : [16*K, OC/16, IC/16] i16, K = 2 or 3 (read from ne[0])
+    //   rin  : [IC]                 f16
+    //   rout : [OC]                 f16
+    //   s_in : [IC]                 f32
+    //   s_out: [OC]                 f32
+    //   bias : [OC]                 f16 (may be zeros)
+    //   x    : [IC, M]              f32
+    //   res  : [OC, M]              f32
+    GGML_API struct ggml_tensor * ggml_escha_linear(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * code,
+            struct ggml_tensor  * rin,
+            struct ggml_tensor  * rout,
+            struct ggml_tensor  * s_in,
+            struct ggml_tensor  * s_out,
+            struct ggml_tensor  * bias,
+            struct ggml_tensor  * x);
 
     // DSA lightning indexer
     //
