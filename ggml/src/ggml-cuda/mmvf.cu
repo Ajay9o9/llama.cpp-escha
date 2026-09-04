@@ -819,7 +819,11 @@ bool ggml_cuda_should_use_mmvf(enum ggml_type type, int cc, const int64_t * src0
             return ne11 <= 8;
         case GGML_TYPE_F16:
             if (GGML_CUDA_CC_IS_NVIDIA(cc)) {
-                const bool src0_small = (src0_ne[1] <= 512 || src0_ne[2]*src0_ne[3] == 1);
+                // ne2*ne3==1 used to mark every 2D matrix "small", including FFN/Q and
+                // vocab-sized lm_heads. MMVF is one-block-per-row and only wins for thin
+                // K/V GEMV; send anything wider to mmf/cublas.
+                const bool src0_small = src0_ne[1] <= 2048 &&
+                    (src0_ne[1] <= 512 || src0_ne[2]*src0_ne[3] == 1);
                 if (ampere_mma_available(cc)) {
                     return src0_small && ne11 == 1;
                 }
@@ -845,7 +849,8 @@ bool ggml_cuda_should_use_mmvf(enum ggml_type type, int cc, const int64_t * src0
             return ne11 <= 8;
         case GGML_TYPE_BF16:
             if (GGML_CUDA_CC_IS_NVIDIA(cc)) {
-                const bool src0_small = (src0_ne[1] <= 512 || src0_ne[2]*src0_ne[3] == 1);
+                const bool src0_small = src0_ne[1] <= 2048 &&
+                    (src0_ne[1] <= 512 || src0_ne[2]*src0_ne[3] == 1);
                 if (ampere_mma_available(cc)) {
                     return src0_small && ne11 == 1;
                 }

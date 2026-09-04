@@ -46,7 +46,8 @@
 // matters there is filling the device.
 #define ESCHA_ROWS_DENSE      64
 #define ESCHA_ROWS_DENSE_GEN   1
-#define ESCHA_GEN_MAX_ROWS    16   // at or below this, use the generation instantiation
+#define ESCHA_ROWS_DENSE_SPEC  4   // speculative verify is 2-8 tokens; reuse decode across them
+#define ESCHA_GEN_MAX_ROWS    16   // at or below this, stay off the 128-row MMA prefill tile
 #define ESCHA_GEN_TARGET_MUL   4
 // prefill tile for the register-tiled kernel. BM*BN = TM*TN*NT, so these four fix the
 // thread count too: NT = (BM/TM)*(BN/TN). BN stays 128 -- activation traffic is
@@ -1123,7 +1124,11 @@ void ggml_cuda_op_escha_mul_mat(ggml_backend_cuda_context & ctx, ggml_tensor * d
 
     // The tensor-core path wants its activations already in fp16 so cp.async can move them
     // verbatim, so the rotation has to know its consumer before it runs.
-    const bool gen = n_rows <= ESCHA_GEN_MAX_ROWS;
+    // n_rows==1 is decode; 2..ESCHA_GEN_MAX_ROWS is speculative verify (reuse decoded
+    // weights across the small batch instead of running the R=1 kernel 4x).
+    const bool decode1 = n_rows == 1;
+    const bool specb   = n_rows > 1 && n_rows <= ESCHA_GEN_MAX_ROWS;
+    const bool gen     = decode1 || specb;
     const bool use_mma = !gen
                       && ggml_cuda_info().devices[ctx.device].cc >= GGML_CUDA_CC_TURING
                       && OC % ESCHA_MMA_BN == 0
@@ -1145,7 +1150,7 @@ void ggml_cuda_op_escha_mul_mat(ggml_backend_cuda_context & ctx, ggml_tensor * d
 
     // slice the IC reduction only as far as it takes to fill the device: at batch 1 the
     // natural grid is just n_ocb blocks, but a long prompt already has plenty of rows
-    const int  R   = gen ? ESCHA_ROWS_DENSE_GEN : ESCHA_ROWS_DENSE;
+    const int  R   = decode1 ? ESCHA_ROWS_DENSE_GEN : (specb ? ESCHA_ROWS_DENSE_SPEC : ESCHA_ROWS_DENSE);
 
     const int n_rb = (n_rows + R - 1)/R;
     // the tiled prefill kernel blocks over BM rows x BN columns instead
@@ -1159,7 +1164,7 @@ void ggml_cuda_op_escha_mul_mat(ggml_backend_cuda_context & ctx, ggml_tensor * d
 
     ggml_cuda_pool_alloc<float> p_buf(ctx.pool(), (size_t) n_slices*n_rows*OC);
 
-    if (gen) {
+    if (decode1) {
         // widest slice any block gets, since lo/hi split nit unevenly by at most one tile
         const int tiles_max = (nit + n_slices - 1)/n_slices;
         const size_t smem = ESCHA_GROUPS*ESCHA_MAX_W*sizeof(uint2)
@@ -1173,6 +1178,19 @@ void ggml_cuda_op_escha_mul_mat(ggml_backend_cuda_context & ctx, ggml_tensor * d
         switch (K) {
             case 2: launch(escha_matmul_dense<2, ESCHA_ROWS_DENSE_GEN>); break;
             case 3: launch(escha_matmul_dense<3, ESCHA_ROWS_DENSE_GEN>); break;
+            default: GGML_ABORT("escha: unsupported K=%d", K);
+        }
+    } else if (specb) {
+        const size_t smem = ESCHA_GROUPS*ESCHA_MAX_W*sizeof(uint2)
+                          + (size_t) ESCHA_ROWS_DENSE_SPEC*ESCHA_TILE*sizeof(float);
+        auto launch = [&](auto kernel) {
+            kernel<<<dim3(n_rb, n_ocb, n_slices), ESCHA_NT, smem, stream>>>(
+                (const int16_t *) code->data, (const half *) lut->data, (const int16_t *) dep->data,
+                (const float *) u_buf.get(), p_buf.get(), IC, OC, n_rows, n_slices);
+        };
+        switch (K) {
+            case 2: launch(escha_matmul_dense<2, ESCHA_ROWS_DENSE_SPEC>); break;
+            case 3: launch(escha_matmul_dense<3, ESCHA_ROWS_DENSE_SPEC>); break;
             default: GGML_ABORT("escha: unsupported K=%d", K);
         }
     } else if (OC % ESCHA_BN != 0) {
