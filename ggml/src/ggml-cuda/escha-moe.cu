@@ -745,7 +745,8 @@ static __global__ void escha_matmul_dense_tiled(
 // The weights stay exact (escha_codebook_h). The ACTIVATIONS are rounded to fp16, which is
 // what escha's own runtime does, and costs rel_rms ~2.1e-4 against the fp32 reference.
 template <int K, int BM, int BN>
-static __global__ void __launch_bounds__(256, 1) escha_matmul_dense_tiled_mma(
+// minBlocks=2: hide reconstruct latency; BM=128 acc[2][8] should still fit.
+static __global__ void __launch_bounds__(256, 2) escha_matmul_dense_tiled_mma(
         const int16_t * __restrict__ code,
         const half    * __restrict__ lut,
         const int16_t * __restrict__ dep,
